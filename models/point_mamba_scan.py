@@ -17,6 +17,7 @@ from timm.models.layers import DropPath
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from mamba_ssm.modules.mamba_simple import Mamba
 from .block_scan import Block
+from .ordering_net import OrderingNetV4
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -473,7 +474,7 @@ class MaskMamba(nn.Module):
                                  rms_norm=self.config.rms_norm,
                                  drop_path=dpr)
 
-        self.OrderScale_gamma_1, self.OrderScale_beta_1 = init_OrderScale(self.trans_dim)
+        self.OrderScale_gamma, self.OrderScale_beta = init_OrderScale(self.trans_dim)
         self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
 
         self.apply(self._init_weights)
@@ -545,7 +546,7 @@ class MaskMamba(nn.Module):
 
         return overall_mask.to(center.device)  # B G
 
-    def forward(self, neighborhood, center, order, order_index, noaug=False):  # generate mask
+    def forward(self, neighborhood, center, noaug=False):  # generate mask
         if self.mask_type == 'rand':
             bool_masked_pos = self._mask_center_rand(center, noaug=noaug)  # B G
         else:
@@ -553,12 +554,8 @@ class MaskMamba(nn.Module):
 
         group_input_tokens = self.encoder(neighborhood)  # B G C
 
-        if order_index == 0:
-            group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma_1, self.OrderScale_beta_1)
-        elif order_index == 1:
-            group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma_2, self.OrderScale_beta_2)
-        else:
-            assert False
+        group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma, self.OrderScale_beta)
+
 
         batch_size, seq_len, C = group_input_tokens.size()
         #
@@ -630,6 +627,8 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         self.drop_path_rate = config.mamba_config.drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.decoder_depth)]
 
+        self.ordering_net = OrderingNetV4(in_channels=config.mamba_config.encoder_dims, num_groups=self.num_group)
+
         self.MAE_decoder = MambaDecoder(
             embed_dim=self.trans_dim,
             depth=self.decoder_depth,
@@ -664,20 +663,27 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         neighborhood, center = self.group_divider(pts)
         B, G, S, _ = neighborhood.shape
 
-        order_list = ['hilbert', 'hilbert-trans']
+        # order_list = ['hilbert', 'hilbert-trans']
         # order_list = ['hilbert']
-        order_index = np.random.choice([i for i in range(len(order_list))], 1, replace=False)
+        # order_index = np.random.choice([i for i in range(len(order_list))], 1, replace=False)
 
-        center, order, index_order, _, _ = serialization_func(center, None, None, order_list[order_index[0]])
-        neighborhood = neighborhood.flatten(0, 1)[order].reshape(B, G, S, -1).contiguous()
+        # center, order, index_order, _, _ = serialization_func(center, None, None, order_list[order_index[0]])
+        # neighborhood = neighborhood.flatten(0, 1)[order].reshape(B, G, S, -1).contiguous()
 
-        x_vis, mask, group_input_tokens = self.MAE_encoder(neighborhood, center, order=order,
-                                                           order_index=order_index[0])
+        feat = self.MAE_encoder.encoder(neighborhood)  # B G C
+
+        P = self.ordering_net.compute_ordering_matrix(feat)
+        # center_p, neigh_p, P = self.ordering_net(center, feat)  # (B,G,3), (B,G,S,3), (B,G,G)
+
+        center_p = torch.einsum('boc,boj->bjc', center, P)
+        neighborhood_p = torch.einsum('bosd,boj->bjsd', neighborhood, P)
+
+        x_vis, mask, group_input_tokens = self.MAE_encoder(neighborhood_p, center_p)
         B, _, C = x_vis.shape  # B VIS C
 
-        pos_emd_vis = self.decoder_pos_embed(center[~mask]).reshape(B, -1, C)
+        pos_emd_vis = self.decoder_pos_embed(center_p[~mask]).reshape(B, -1, C)
 
-        pos_emd_mask = self.decoder_pos_embed(center[mask]).reshape(B, -1, C)
+        pos_emd_mask = self.decoder_pos_embed(center_p[mask]).reshape(B, -1, C)
 
         x_full = torch.zeros_like(group_input_tokens, device=group_input_tokens.device)
         x_full[~mask] = x_vis.reshape(-1, C)
@@ -691,16 +697,16 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         B, M, C = x_rec.shape
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
 
-        gt_points = neighborhood[mask].reshape(B * M, -1, 3)
+        gt_points = neighborhood_p[mask].reshape(B * M, -1, 3)
         loss1 = self.loss_func(rebuild_points, gt_points)
 
         if vis:  # visualization
-            vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)
-            full_vis = vis_points + center[~mask].unsqueeze(1)
-            full_rebuild = rebuild_points + center[mask].unsqueeze(1)
+            vis_points = neighborhood_p[~mask].reshape(B * (self.num_group - M), -1, 3)
+            full_vis = vis_points + center_p[~mask].unsqueeze(1)
+            full_rebuild = rebuild_points + center_p[mask].unsqueeze(1)
             full = torch.cat([full_vis, full_rebuild], dim=0)
             # full_points = torch.cat([rebuild_points,vis_points], dim=0)
-            full_center = torch.cat([center[mask], center[~mask]], dim=0)
+            full_center = torch.cat([center_p[mask], center_p[~mask]], dim=0)
             # full = full_points + full_center.unsqueeze(1)
             ret2 = full_vis.reshape(-1, 3).unsqueeze(0)
             ret1 = full.reshape(-1, 3).unsqueeze(0)
