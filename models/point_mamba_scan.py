@@ -17,7 +17,7 @@ from timm.models.layers import DropPath
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from mamba_ssm.modules.mamba_simple import Mamba
 from .block_scan import Block
-from .ordering_net import OrderingNetV4
+from .ordering_net import OrderingNetV4, OrderingNetV4Efficient
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -315,6 +315,8 @@ class PointMambaScan(nn.Module):
         if self.max_head and self.avg_head:
             self.HEAD_CHANEL += 1
 
+        self.ordering_net = OrderingNetV4(in_channels=config.encoder_dims, num_groups=self.num_group)
+
         self.cls_head_finetune = nn.Sequential(
             nn.Linear(self.trans_dim * self.HEAD_CHANEL, 256),
             nn.BatchNorm1d(256),
@@ -329,7 +331,7 @@ class PointMambaScan(nn.Module):
 
         self.build_loss_func()
 
-        self.OrderScale_gamma_1, self.OrderScale_beta_1 = init_OrderScale(self.trans_dim)
+        self.OrderScale_gamma, self.OrderScale_beta = init_OrderScale(self.trans_dim)
         self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
 
     def build_loss_func(self):
@@ -392,33 +394,24 @@ class PointMambaScan(nn.Module):
     def forward(self, pts):
         neighborhood, center = self.group_divider(pts)
         group_input_tokens = self.encoder(neighborhood)  # B G N
-        pos = self.pos_embed(center)  # B G C
 
-        # # reordering strategy
-        _, _, _, group_input_tokens_forward, pos_forward = serialization_func(center, group_input_tokens, pos,
-                                                                              'hilbert')
-        _, _, _, group_input_tokens_backward, pos_backward = serialization_func(center, group_input_tokens, pos,
-                                                                                'hilbert-trans')
-        group_input_tokens_forward = apply_OrderScale(group_input_tokens_forward,
-                                                      self.OrderScale_gamma_1, self.OrderScale_beta_1)
-        group_input_tokens_backward = apply_OrderScale(group_input_tokens_backward,
-                                                       self.OrderScale_gamma_2, self.OrderScale_beta_2)
+
+        P = self.ordering_net.compute_ordering_matrix(group_input_tokens)
+        # center_p, neigh_p, P = self.ordering_net(center, feat)  # (B,G,3), (B,G,S,3), (B,G,G)
+
+        reordered_center = torch.einsum('boc,boj->bjc', center, P)
+        reordered_neighborhood = torch.einsum('bosd,boj->bjsd', neighborhood, P)
+
+        pos = self.pos_embed(reordered_center)  # B G C
+
+        group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma, self.OrderScale_beta)
+
         if self.use_cls_token:
-            cls_token = self.cls_token.expand(group_input_tokens_forward.size(0), -1, -1)
-            cls_pos = self.cls_pos.expand(group_input_tokens_forward.size(0), -1, -1)
-            pos = torch.cat([pos_forward, pos_backward, cls_token], dim=1)
-            group_input_tokens = torch.cat([group_input_tokens_forward, group_input_tokens_backward, cls_pos], dim=1)
+            cls_token = self.cls_token.expand(group_input_tokens.size(0), -1, -1)
+            cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)
         else:
-            pos = torch.cat([pos_forward, pos_backward], dim=1)
-            group_input_tokens = torch.cat([group_input_tokens_forward, group_input_tokens_backward], dim=1)
+            pass
 
-        # cls_token = self.cls_token.expand(group_input_tokens.size(0), -1, -1)
-        # cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)
-        # pos = torch.cat([cls_pos, pos], dim=1)
-        # group_input_tokens = torch.cat([cls_token, group_input_tokens], dim=1)
-        #
-        # # group_input_tokens = group_input_tokens_forward
-        # # pos = pos_forward
 
         x = group_input_tokens
         x = self.blocks(x, pos)
@@ -475,7 +468,6 @@ class MaskMamba(nn.Module):
                                  drop_path=dpr)
 
         self.OrderScale_gamma, self.OrderScale_beta = init_OrderScale(self.trans_dim)
-        self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
 
         self.apply(self._init_weights)
 
@@ -627,7 +619,7 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         self.drop_path_rate = config.mamba_config.drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.decoder_depth)]
 
-        self.ordering_net = OrderingNetV4(in_channels=config.mamba_config.encoder_dims, num_groups=self.num_group)
+        self.ordering_net = OrderingNetV4Efficient(in_channels=config.mamba_config.encoder_dims, num_groups=self.num_group)
 
         self.MAE_decoder = MambaDecoder(
             embed_dim=self.trans_dim,
@@ -672,18 +664,14 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
 
         feat = self.MAE_encoder.encoder(neighborhood)  # B G C
 
-        P = self.ordering_net.compute_ordering_matrix(feat)
-        # center_p, neigh_p, P = self.ordering_net(center, feat)  # (B,G,3), (B,G,S,3), (B,G,G)
+        reordered_center_coords, reordered_group_features,reordered_group_coords, perm_indices = self.ordering_net(center, feat, neighborhood)  # (B,G,3), (B,G,C), (B,G,G)
 
-        center_p = torch.einsum('boc,boj->bjc', center, P)
-        neighborhood_p = torch.einsum('bosd,boj->bjsd', neighborhood, P)
-
-        x_vis, mask, group_input_tokens = self.MAE_encoder(neighborhood_p, center_p)
+        x_vis, mask, group_input_tokens = self.MAE_encoder(reordered_group_coords, reordered_center_coords)
         B, _, C = x_vis.shape  # B VIS C
 
-        pos_emd_vis = self.decoder_pos_embed(center_p[~mask]).reshape(B, -1, C)
+        pos_emd_vis = self.decoder_pos_embed(reordered_center_coords[~mask]).reshape(B, -1, C)
 
-        pos_emd_mask = self.decoder_pos_embed(center_p[mask]).reshape(B, -1, C)
+        pos_emd_mask = self.decoder_pos_embed(reordered_center_coords[mask]).reshape(B, -1, C)
 
         x_full = torch.zeros_like(group_input_tokens, device=group_input_tokens.device)
         x_full[~mask] = x_vis.reshape(-1, C)
@@ -697,16 +685,16 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         B, M, C = x_rec.shape
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
 
-        gt_points = neighborhood_p[mask].reshape(B * M, -1, 3)
+        gt_points = reordered_group_coords[mask].reshape(B * M, -1, 3)
         loss1 = self.loss_func(rebuild_points, gt_points)
 
         if vis:  # visualization
-            vis_points = neighborhood_p[~mask].reshape(B * (self.num_group - M), -1, 3)
-            full_vis = vis_points + center_p[~mask].unsqueeze(1)
-            full_rebuild = rebuild_points + center_p[mask].unsqueeze(1)
+            vis_points = reordered_group_coords[~mask].reshape(B * (self.num_group - M), -1, 3)
+            full_vis = vis_points + reordered_center_coords[~mask].unsqueeze(1)
+            full_rebuild = rebuild_points + reordered_center_coords[mask].unsqueeze(1)
             full = torch.cat([full_vis, full_rebuild], dim=0)
             # full_points = torch.cat([rebuild_points,vis_points], dim=0)
-            full_center = torch.cat([center_p[mask], center_p[~mask]], dim=0)
+            full_center = torch.cat([reordered_center_coords[mask], reordered_center_coords[~mask]], dim=0)
             # full = full_points + full_center.unsqueeze(1)
             ret2 = full_vis.reshape(-1, 3).unsqueeze(0)
             ret1 = full.reshape(-1, 3).unsqueeze(0)
